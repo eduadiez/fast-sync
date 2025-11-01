@@ -15,9 +15,10 @@ use tokio::{
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    /// Destination IP or FQDN
+
+    /// Destination IPs or FQDNs (comma-separated)
     #[arg(long, default_value = "10.0.0.2")]
-    dest_ip: String,
+    dest_ips: String,
 
     /// Destination port
     #[arg(long, default_value_t = 5001)]
@@ -32,12 +33,24 @@ struct Args {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    let dest_ip = args.dest_ip;
+
     let dest_port = args.dest_port;
     let watch_dir = args.watch_dir;
+    let dest_ips: Vec<String> = args.dest_ips.split(',').map(|s| s.trim().to_string()).collect();
 
-    let mut conn = connect_persistent(&dest_ip, dest_port).await?;
-    eprintln!("[*] Connected to {}:{}", dest_ip, dest_port);
+    // Establish connections to all destinations
+    let mut conns = Vec::new();
+    for ip in &dest_ips {
+        match connect_persistent(ip, dest_port).await {
+            Ok(conn) => {
+                eprintln!("[*] Connected to {}:{}", ip, dest_port);
+                conns.push((ip.clone(), conn));
+            },
+            Err(e) => {
+                eprintln!("[!] Failed to connect to {}:{}: {e}", ip, dest_port);
+            }
+        }
+    }
 
     // inotify: close after write events (recursive)
     let mut inotify = Inotify::init().context("init inotify")?;
@@ -58,11 +71,22 @@ async fn main() -> Result<()> {
                     let event_time = Instant::now();
                     sleep(Duration::from_millis(1)).await;
                     let send_start = Instant::now();
-                    if let Err(e) = send_one(&mut conn, &full, Path::new(&watch_dir)).await {
-                        eprintln!("[!] Send error: {e}. Retrying...");
-                        // Retry with reconnection
-                        conn = connect_persistent(&dest_ip, dest_port).await?;
-                        send_one(&mut conn, &full, Path::new(&watch_dir)).await?;
+                    for (ip, conn) in conns.iter_mut() {
+                        if let Err(e) = send_one(conn, &full, Path::new(&watch_dir)).await {
+                            eprintln!("[!] Send error to {ip}: {e}. Retrying...");
+                            // Retry with reconnection
+                            match connect_persistent(ip, dest_port).await {
+                                Ok(mut new_conn) => {
+                                    *conn = new_conn;
+                                    if let Err(e2) = send_one(conn, &full, Path::new(&watch_dir)).await {
+                                        eprintln!("[!] Retry failed for {ip}: {e2}");
+                                    }
+                                },
+                                Err(e2) => {
+                                    eprintln!("[!] Reconnect failed for {ip}: {e2}");
+                                }
+                            }
+                        }
                     }
                     let send_end = Instant::now();
                     let event_to_send = send_start.duration_since(event_time);
